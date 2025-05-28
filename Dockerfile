@@ -8,12 +8,21 @@ RUN apt-get update && apt-get install -y \
     libonig-dev \
     libxml2-dev \
     libpq-dev \
+    libzip-dev \
     zip \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install PHP extensions
-RUN docker-php-ext-install pdo_pgsql pdo_mysql mbstring exif pcntl bcmath gd
+RUN docker-php-ext-install \
+    pdo_pgsql \
+    pdo_mysql \
+    mbstring \
+    exif \
+    pcntl \
+    bcmath \
+    gd \
+    zip
 
 # Install Composer
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
@@ -21,97 +30,160 @@ COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 # Set working directory
 WORKDIR /var/www/html
 
+# Copy composer files first for better caching
+COPY composer.json composer.lock ./
+
+# Install dependencies
+RUN composer install \
+    --no-scripts \
+    --no-autoloader \
+    --no-dev \
+    --prefer-dist
+
 # Copy application files
 COPY . .
 
-# Install dependencies with error handling
-RUN composer install --optimize-autoloader --no-dev --ignore-platform-reqs || \
-    (composer update --optimize-autoloader --no-dev --ignore-platform-reqs && \
-     composer install --optimize-autoloader --no-dev --ignore-platform-reqs)
+# Copy .env.example to .env if .env doesn't exist
+RUN if [ ! -f .env ]; then cp .env.example .env; fi
 
-# Create necessary directories and set permissions
-RUN mkdir -p /var/www/html/storage/logs \
-    && mkdir -p /var/www/html/storage/framework/{cache,sessions,views} \
-    && mkdir -p /var/www/html/bootstrap/cache
+# Complete composer installation
+RUN composer dump-autoload --optimize --no-dev
 
-# Set permissions before running artisan commands
-RUN chown -R www-data:www-data /var/www/html
-RUN chmod -R 755 /var/www/html
-RUN chmod -R 775 /var/www/html/storage /var/www/html/bootstrap/cache
+# Create necessary directories
+RUN mkdir -p storage/logs \
+    && mkdir -p storage/framework/cache \
+    && mkdir -p storage/framework/sessions \
+    && mkdir -p storage/framework/views \
+    && mkdir -p bootstrap/cache
 
-# Generate application key (only if not set)
-RUN php artisan key:generate --force
+# Set proper permissions
+RUN chown -R www-data:www-data /var/www/html \
+    && chmod -R 755 /var/www/html \
+    && chmod -R 775 storage bootstrap/cache
 
-# Clear any cached config that might cause issues
+# Generate application key
+RUN php artisan key:generate --no-interaction
+
+# Clear and cache configurations (with error handling)
 RUN php artisan config:clear || true
 RUN php artisan cache:clear || true
 RUN php artisan view:clear || true
 RUN php artisan route:clear || true
 
-# Remove any cached files manually
-RUN rm -f bootstrap/cache/config.php bootstrap/cache/routes.php bootstrap/cache/services.php || true
+# Only cache in production
+RUN php artisan config:cache || true
 
 # Configure Apache
 RUN a2enmod rewrite
 
-# Apache configuration
-COPY <<EOF /etc/apache2/sites-available/000-default.conf
-<VirtualHost *:80>
-    DocumentRoot /var/www/html/public
-    
-    <Directory /var/www/html/public>
-        AllowOverride All
-        Require all granted
-        Options -Indexes
-    </Directory>
-    
-    # Enable error logging
-    ErrorLog \${APACHE_LOG_DIR}/error.log
-    CustomLog \${APACHE_LOG_DIR}/access.log combined
-    LogLevel warn
-</VirtualHost>
-EOF
+# Create Apache configuration
+RUN echo '<VirtualHost *:80>\n\
+    DocumentRoot /var/www/html/public\n\
+    ServerName localhost\n\
+    \n\
+    <Directory /var/www/html/public>\n\
+        Options -Indexes +FollowSymLinks\n\
+        AllowOverride All\n\
+        Require all granted\n\
+        \n\
+        # Handle Laravel routing\n\
+        RewriteEngine On\n\
+        RewriteCond %{REQUEST_FILENAME} !-d\n\
+        RewriteCond %{REQUEST_FILENAME} !-f\n\
+        RewriteRule ^(.*)$ index.php [QSA,L]\n\
+    </Directory>\n\
+    \n\
+    # Logging\n\
+    ErrorLog ${APACHE_LOG_DIR}/error.log\n\
+    CustomLog ${APACHE_LOG_DIR}/access.log combined\n\
+    LogLevel warn\n\
+    \n\
+    # Security headers\n\
+    Header always set X-Content-Type-Options nosniff\n\
+    Header always set X-Frame-Options DENY\n\
+    Header always set X-XSS-Protection "1; mode=block"\n\
+</VirtualHost>' > /etc/apache2/sites-available/000-default.conf
 
-# PHP configuration for better error reporting
-RUN echo "log_errors = On" >> /usr/local/etc/php/conf.d/docker-php-logging.ini
-RUN echo "error_log = /var/log/apache2/php_errors.log" >> /usr/local/etc/php/conf.d/docker-php-logging.ini
-RUN echo "display_errors = On" >> /usr/local/etc/php/conf.d/docker-php-logging.ini
-RUN echo "display_startup_errors = On" >> /usr/local/etc/php/conf.d/docker-php-logging.ini
+# Enable headers module for security headers
+RUN a2enmod headers
 
-EXPOSE 80
+# PHP configuration for production
+RUN echo 'log_errors = On\n\
+error_log = /var/log/apache2/php_errors.log\n\
+display_errors = Off\n\
+display_startup_errors = Off\n\
+expose_php = Off\n\
+max_execution_time = 300\n\
+memory_limit = 256M\n\
+post_max_size = 32M\n\
+upload_max_filesize = 32M\n\
+max_file_uploads = 20' > /usr/local/etc/php/conf.d/laravel.ini
 
-# Improved start script
-COPY <<EOF /usr/local/bin/start.sh
+# Create startup script
+COPY <<'EOF' /usr/local/bin/start.sh
 #!/bin/bash
 set -e
 
-echo "Starting Laravel application..."
+echo "🚀 Starting Laravel Application..."
 
-# Skip database operations for now
-# echo "Checking database connection..."
-# php artisan tinker --execute="DB::connection()->getPdo();"
+# Check if APP_KEY is set
+if [ -z "$APP_KEY" ] || [ "$APP_KEY" = "base64:" ]; then
+    echo "⚠️  APP_KEY not set, generating..."
+    php artisan key:generate --force --no-interaction
+fi
 
-# echo "Running migrations..."
-# php artisan migrate --force
+# Wait for database if needed (optional)
+if [ -n "$DB_HOST" ]; then
+    echo "⏳ Checking database connection..."
+    php -r "
+        try {
+            \$pdo = new PDO('mysql:host=$DB_HOST;port=${DB_PORT:-3306};dbname=$DB_DATABASE', '$DB_USERNAME', '$DB_PASSWORD');
+            echo '✅ Database connection successful' . PHP_EOL;
+        } catch (Exception \$e) {
+            echo '⚠️  Database connection failed: ' . \$e->getMessage() . PHP_EOL;
+            echo 'Continuing without database...' . PHP_EOL;
+        }
+    "
+fi
 
-# Clear any problematic cache
-php artisan config:clear || true
-php artisan route:clear || true
-php artisan view:clear || true
-php artisan cache:clear || true
+# Run migrations if requested
+if [ "$RUN_MIGRATIONS" = "true" ]; then
+    echo "🔄 Running database migrations..."
+    php artisan migrate --force --no-interaction || echo "⚠️  Migrations failed, continuing..."
+fi
 
-# Only cache if not in debug mode
-if [ "\$APP_DEBUG" != "true" ]; then
-    echo "Optimizing application..."
+# Clear caches in development
+if [ "$APP_ENV" = "local" ] || [ "$APP_DEBUG" = "true" ]; then
+    echo "🧹 Clearing caches for development..."
+    php artisan config:clear || true
+    php artisan route:clear || true
+    php artisan view:clear || true
+    php artisan cache:clear || true
+else
+    echo "🚀 Optimizing for production..."
     php artisan config:cache || true
     php artisan route:cache || true
     php artisan view:cache || true
 fi
 
-echo "Starting Apache..."
-apache2-foreground
+# Ensure proper permissions
+chown -R www-data:www-data storage bootstrap/cache
+chmod -R 775 storage bootstrap/cache
+
+echo "✅ Laravel application ready!"
+echo "📊 Environment: ${APP_ENV:-production}"
+echo "🐛 Debug mode: ${APP_DEBUG:-false}"
+
+# Start Apache
+exec apache2-foreground
 EOF
 
 RUN chmod +x /usr/local/bin/start.sh
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost/ || exit 1
+
+EXPOSE 80
 
 CMD ["/usr/local/bin/start.sh"]
