@@ -45,6 +45,11 @@ RUN php artisan key:generate --force
 # Clear any cached config that might cause issues
 RUN php artisan config:clear || true
 RUN php artisan cache:clear || true
+RUN php artisan view:clear || true
+RUN php artisan route:clear || true
+
+# Remove any cached files manually
+RUN rm -f bootstrap/cache/config.php bootstrap/cache/routes.php bootstrap/cache/services.php || true
 
 # Configure Apache
 RUN a2enmod rewrite
