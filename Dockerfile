@@ -21,17 +21,13 @@ COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 # Set working directory
 WORKDIR /var/www/html
 
-# Copy composer files first for better caching
-COPY composer.json composer.lock ./
-
-# Install dependencies
-RUN composer install --optimize-autoloader --no-dev --no-scripts
-
 # Copy application files
 COPY . .
 
-# Complete composer installation
-RUN composer install --optimize-autoloader --no-dev
+# Install dependencies with error handling
+RUN composer install --optimize-autoloader --no-dev --ignore-platform-reqs || \
+    (composer update --optimize-autoloader --no-dev --ignore-platform-reqs && \
+     composer install --optimize-autoloader --no-dev --ignore-platform-reqs)
 
 # Create necessary directories and set permissions
 RUN mkdir -p /var/www/html/storage/logs \
