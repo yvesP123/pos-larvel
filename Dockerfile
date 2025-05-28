@@ -30,15 +30,27 @@ COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 # Set working directory
 WORKDIR /var/www/html
 
-# Copy composer files first for better caching
-COPY composer.json composer.lock ./
+# Set composer memory limit and disable platform requirements
+ENV COMPOSER_MEMORY_LIMIT=-1
+ENV COMPOSER_ALLOW_SUPERUSER=1
 
-# Install dependencies
-RUN composer install \
+# Copy composer files first for better caching
+COPY composer.json composer.lock* ./
+
+# Clear composer cache and install dependencies with better error handling
+RUN composer clear-cache && \
+    composer install \
     --no-scripts \
     --no-autoloader \
     --no-dev \
-    --prefer-dist
+    --prefer-dist \
+    --ignore-platform-reqs \
+    --optimize-autoloader \
+    --no-interaction \
+    --verbose || \
+    (echo "First install failed, trying with updates..." && \
+     composer update --no-scripts --no-dev --ignore-platform-reqs --no-interaction --verbose && \
+     composer install --no-scripts --no-autoloader --no-dev --prefer-dist --ignore-platform-reqs --no-interaction)
 
 # Copy application files
 COPY . .
@@ -46,8 +58,9 @@ COPY . .
 # Copy .env.example to .env if .env doesn't exist
 RUN if [ ! -f .env ]; then cp .env.example .env; fi
 
-# Complete composer installation
-RUN composer dump-autoload --optimize --no-dev
+# Complete composer installation with error handling
+RUN composer dump-autoload --optimize --no-dev --no-interaction || \
+    (composer dump-autoload --optimize --no-interaction)
 
 # Create necessary directories
 RUN mkdir -p storage/logs \
